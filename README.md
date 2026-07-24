@@ -5,6 +5,8 @@ This is a bot to "Cheat" the game of Typing of the Dead.
 
 This game is very nostalgic for me. I redownloaded the gamer recently and realized that I am just too slow. So I decided to beat the game with a bot.
 
-The main investigation is detailed in the devLog.cpp file
+The main investigation is detailed in the devLog.cpp file.
+
+
 Disclaimer, I did use Claude to help write the bot
 
