@@ -552,6 +552,8 @@ hence we get:
 
                 static const uint32_t WORD_PTR_OFF    = 0x50;       // struct -> dict string pointer
 
+do note that 80 is 0x50 in hex. therefore we see the -80 becomes 0x50
+
 
 
 12. also the acitve word list pointer is at 0x008395C4
@@ -638,3 +640,98 @@ notice the pointer math: (arrStart + i * 4)
 Word* is 32 bit since this is a 32 bit process.
 
 Hence we get our word detection
+
+
+
+15. Numbers are encoded completely differently 
+heres an example dump:
+
+                on screen: [$][B][J]
+                on screen: (none)
+                ---- raw active-word array ----
+                  slot[ 8] struct=0x0C76A100 vt=0x004B2A30* wp=0x005958F4 (image) raw=|J...H...G...F...|  ints=0000004A 00000048 00000047
+                  slot[ 9] struct=0x0C76B7F0 vt=0x004B2A30* wp=0x0059590C (image) raw=|B...9...8...7...|  ints=00000042 00000039 00000038
+                  slot[10] struct=0x0C76CEE0 vt=0x004B2A30* wp=0x0059588C (image) raw=|$...'... ...%...|  ints=00000024 00000027 00000020                               '
+                  slot[11] struct=0x0C76E5D0 vt=0x004B2A30* wp=0x005EAA54 (image) raw=|.W.......V......|  ints=00005782 000000A9 00005682
+                      ^ NOT read as a word - full struct 0x0C76E5D0:
+                     +0 0x0C76E5D0 : 004B2A30  |0*K.|  STATIC ptr 
+                     +4 0x0C76E5D4 : 00000000  |....|  int        
+                     +8 0x0C76E5D8 : 00013F6C  |l?..|  int?       
+                    +12 0x0C76E5DC : 00000001  |....|  int        
+                    +16 0x0C76E5E0 : 00000000  |....|  int        
+                    +20 0x0C76E5E4 : 00000000  |....|  int        
+                    +24 0x0C76E5E8 : 00000000  |....|  int        
+                    +28 0x0C76E5EC : 00000000  |....|  int        
+                    +32 0x0C76E5F0 : 0C76D1B0  |..v.|  heap ptr   
+                    +36 0x0C76E5F4 : 00000000  |....|  int        
+                    +40 0x0C76E5F8 : 00000000  |....|  int        
+                    +44 0x0C76E5FC : 0C76E5D0  |..v.|  heap ptr    -> "0*K"                                                                                             "
+                    +48 0x0C76E600 : 00000000  |....|  int        
+                    +52 0x0C76E604 : C05E2917  |.)^.|  int?       
+                    +56 0x0C76E608 : C0A014C6  |....|  int?       
+                    +60 0x0C76E60C : C23EF340  |@.>.|  int?       
+                    +64 0x0C76E610 : 3F800000  |...?|  heap ptr   
+                    +68 0x0C76E614 : 3EE66666  |ff.>|  heap ptr   
+                    +72 0x0C76E618 : 3F523F47  |G?R?|  heap ptr   
+                    +76 0x0C76E61C : 00000000  |....|  int        
+                    +80 0x0C76E620 : 005EAA54  |T.^.|  STATIC ptr 
+                    +84 0x0C76E624 : 005EAA50  |P.^.|  STATIC ptr 
+                    +88 0x0C76E628 : 00000038  |8...|  int        
+                    +92 0x0C76E62C : 00000000  |....|  int        
+                    +96 0x0C76E630 : 00000000  |....|  int        
+                  slot[12] struct=0x0C76FCC0 vt=0x004B2A30* wp=0x005EAA6C (image) raw=|.T.......S......|  ints=00005482 000000A6 00005382
+                      ^ NOT read as a word - full struct 0x0C76FCC0:
+                     +0 0x0C76FCC0 : 004B2A30  |0*K.|  STATIC ptr 
+                     +4 0x0C76FCC4 : 00000000  |....|  int        
+                     +8 0x0C76FCC8 : 00013F6E  |n?..|  int?       
+                    +12 0x0C76FCCC : 00000001  |....|  int        
+                    +16 0x0C76FCD0 : 00000000  |....|  int        
+                    +20 0x0C76FCD4 : 00000000  |....|  int        
+                    +24 0x0C76FCD8 : 00000000  |....|  int        
+                    +28 0x0C76FCDC : 00000000  |....|  int        
+                    +32 0x0C76FCE0 : 0C76E8A0  |..v.|  heap ptr   
+                    +36 0x0C76FCE4 : 00000000  |....|  int        
+                    +40 0x0C76FCE8 : 00000000  |....|  int        
+                    +44 0x0C76FCEC : 0C76FCC0  |..v.|  heap ptr    -> "0*K"                                                                                             "
+                    +48 0x0C76FCF0 : 00000000  |....|  int        
+                    +52 0x0C76FCF4 : 40310D2E  |..1@|  heap ptr   
+                    +56 0x0C76FCF8 : C09AE2B9  |....|  int?       
+                    +60 0x0C76FCFC : C2702898  |.(p.|  int?       
+                    +64 0x0C76FD00 : 3F800000  |...?|  heap ptr   
+                    +68 0x0C76FD04 : 3EE66666  |ff.>|  heap ptr   
+                    +72 0x0C76FD08 : 3F800000  |...?|  heap ptr   
+                    +76 0x0C76FD0C : 00000000  |....|  int        
+                    +80 0x0C76FD10 : 005EAA6C  |l.^.|  STATIC ptr 
+                    +84 0x0C76FD14 : 005EAA68  |h.^.|  STATIC ptr 
+                    +88 0x0C76FD18 : 00000035  |5...|  int        
+                    +92 0x0C76FD1C : 00000000  |....|  int        
+                    +96 0x0C76FD20 : 00000000  |....|  int        
+                -------------------------------
+
+  why we are suppose to also have he words "8" and "5"
+
+
+
+so we first detected [R][W][X]
+
+                0x0000004A is J 
+                0x00000042 is B 
+                0x00000024 is $ 
+
+but we have no idea what 
+
+                0x00005782
+                0x00005482
+
+is. Its definitly not ASCII. Low byte is 0x82, not a digit.
+
+
+16. if we look deeply, we see whats going on
+
+
+                +88 0x0C76E628 : 00000038  |8...|  int    
+
+
+                +88 0x0C76FD18 : 00000035  |5...|  int     
+
+so at +88 (0x58 in hex) offset, we see the actual numbers

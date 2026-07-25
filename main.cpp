@@ -222,7 +222,7 @@ void SendKey(WORD scanCode)
     SendInput(1, &in[1], sizeof(INPUT));
 }
 
-void TypeWord(const std::string& word)
+void TypeWord(const std::string& word)                 // scan-code version (ACTIVE - game reads scan codes)
 {
     const WORD SHIFT_SCAN = 0x2A;                      // left-shift scan code
     for (char c : word) {
@@ -248,6 +248,33 @@ void TypeWord(const std::string& word)
         }
 
         Sleep(20);                                     // gap between keystrokes
+    }
+}
+
+// Inject a single character straight into the focused window as Unicode. This bypasses
+// scan codes, keyboard layout, and Shift entirely, so letters, DIGITS, and symbols are
+// all delivered identically - which the scan-code path did not manage for digits.
+void SendUnicodeChar(wchar_t ch)
+{
+    INPUT in[2] = {};
+    in[0].type       = INPUT_KEYBOARD;
+    in[0].ki.wScan   = ch;                               // the UTF-16 code unit
+    in[0].ki.dwFlags = KEYEVENTF_UNICODE;                // key down
+    in[1]            = in[0];
+    in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    SendInput(1, &in[0], sizeof(INPUT));
+    Sleep(15);
+    SendInput(1, &in[1], sizeof(INPUT));
+}
+
+// Unicode-injection version. UNUSED for this game: it delivers WM_CHAR, which this
+// title (DirectInput / raw scan codes) ignores, so nothing types. Kept for reference /
+// games that read character input.
+void TypeWordUnicode(const std::string& word)
+{
+    for (char c : word) {
+        SendUnicodeChar((wchar_t)(uint8_t)c);            // treat each byte as ASCII/Latin-1
+        Sleep(20);                                       // gap between keystrokes
     }
 }
 
@@ -408,10 +435,11 @@ void FindReferrers(HANDLE hProcess, uint32_t lo, uint32_t hi, uint32_t anchor,
 }
 
 
-// A word struct: vtable at +0, dictionary-string pointer at +WORD_PTR_OFF (+0x58 holds
-// an inline UPPERCASE copy). These constants are image-relative, so add `base` at runtime.
+// A word struct: vtable at +0, a text pointer at +0x50, and an INLINE copy of the current
+// text at +0x58 (e.g. "MIMOSA", or a single "8"). Constants are image-relative -> add base.
 static const uint32_t WORD_VTABLE_RVA = 0xB2A30;    // 0x004B2A30 - base
-static const uint32_t WORD_PTR_OFF    = 0x50;       // struct -> dict string pointer
+static const uint32_t WORD_PTR_OFF    = 0x50;       // struct -> text pointer (letters/words)
+static const uint32_t WORD_INLINE_OFF = 0x58;       // struct -> inline text (digits & words)
 static const uint32_t WORD_ARRAY_RVA  = 0x4395C4;   // static active-word pointer array
 
 // Resolve one word-struct pointer -> its dictionary word ("" if not a valid word struct).
@@ -422,10 +450,16 @@ std::string WordFromStruct(HANDLE hProcess, uint32_t structPtr, uint32_t vtable,
     SIZE_T g = 0; uint32_t vt = 0, wp = 0;
     if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)structPtr, &vt, 4, &g) || g != 4 || vt != vtable)
         return "";                                       // wrong/absent vtable -> not a word struct
-    if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(structPtr + WORD_PTR_OFF), &wp, 4, &g) || g != 4)
-        return "";
-    if (wp < imgBase || wp >= imgEnd) return "";         // dict string lives in the image
-    return ReadWordStrict(hProcess, wp);
+
+    // Primary: follow the +0x50 pointer into the image (letters, symbols, dictionary words).
+    if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(structPtr + WORD_PTR_OFF), &wp, 4, &g)
+        && g == 4 && wp >= imgBase && wp < imgEnd) {
+        std::string w = ReadWordStrict(hProcess, wp);
+        if (!w.empty()) return w;
+    }
+    // Fallback: number prompts store the digit INLINE at +0x58 (their +0x50 points at
+    // non-text data). Reading inline here also works for words stored in place.
+    return ReadWordStrict(hProcess, structPtr + WORD_INLINE_OFF);
 }
 
 // AUTHORITATIVE: read the game's static active-word pointer array; each valid slot -> word.
@@ -482,6 +516,44 @@ std::vector<std::string> EnumWordsByVtable(HANDLE hProcess, uint32_t vtable,
     return words;
 }
 
+
+// Diagnostic: dump every populated slot of the active-word array WITHOUT the vtable /
+// image-range / printable filters, so we can see why some prompts (e.g. digits) don't
+// show up - wrong vtable? word pointer into the heap instead of the image? odd bytes?
+void DumpArrayRaw(HANDLE hProcess, uint32_t arrStart, int slots,
+                  uint32_t vtable, uintptr_t imgBase, uintptr_t imgEnd)
+{
+    printf("---- raw active-word array ----\n");
+    for (int i = 0; i < slots; ++i) {
+        uint32_t sp = 0; SIZE_T g = 0;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(arrStart + i * 4), &sp, 4, &g) || g != 4)
+            continue;
+        if (sp < imgEnd) continue;                       // only slots pointing at heap objects
+        uint32_t vt = 0, wp = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)sp, &vt, 4, &g);
+        ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(sp + WORD_PTR_OFF), &wp, 4, &g);
+        const char* loc = (wp >= imgBase && wp < imgEnd) ? "image"
+                        : (wp >= imgEnd)                 ? "heap "
+                        :                                  "low  ";
+        char raw[24] = {0}; SIZE_T got = 0;              // raw bytes at the word pointer
+        ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)wp, raw, 16, &got);
+        char view[17];
+        for (int k = 0; k < 16; ++k) view[k] = (raw[k] >= 0x20 && raw[k] <= 0x7E) ? raw[k] : '.';
+        view[16] = '\0';
+        uint32_t i0 = 0, i1 = 0, i2 = 0;                 // first three 4-byte values, in hex
+        memcpy(&i0, raw, 4); memcpy(&i1, raw + 4, 4); memcpy(&i2, raw + 8, 4);
+        printf("  slot[%2d] struct=0x%08X vt=0x%08X%s wp=0x%08X (%s) raw=|%s|  ints=%08X %08X %08X\n",
+               i, sp, vt, (vt == vtable) ? "*" : " ", wp, loc, view, i0, i1, i2);
+
+        // if we can't read a word from this slot, dump its whole struct so we can find
+        // where the value (e.g. a digit) actually lives for these odd prompts.
+        if (WordFromStruct(hProcess, sp, vtable, imgBase, imgEnd).empty()) {
+            printf("      ^ NOT read as a word - full struct 0x%08X:\n", sp);
+            DumpAround(hProcess, sp, 0, 0x60, imgBase, imgEnd);
+        }
+    }
+    printf("-------------------------------\n");
+}
 
 int main()
 {
@@ -647,9 +719,9 @@ int main()
     // F8 = toggle the bot on/off (OFF = hands off, you type yourself);  F10 = quit.
     // Focus the GAME window: keystrokes go to the foreground app, while F8/F10 are read
     // globally so they still fire while the game has focus.
-    bool botOn = false, prevTog = false, prevQuit = false;
+    bool botOn = false, prevTog = false, prevQuit = false, prevDump = false;
     std::string lastTyped, lastShown;
-    printf("\nReady - focus the game.   [F8] bot on/off (starts OFF)   [F10] quit\n");
+    printf("\nReady - focus the game.   [F8] bot on/off (starts OFF)   [F9] raw dump   [F10] quit\n");
 
     while (true) {
         bool tog = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;      // edge-detected toggle
@@ -661,16 +733,23 @@ int main()
         prevTog = tog;
 
         bool quit = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (quit && !prevQuit) 
+        if (quit && !prevQuit)
         {
             break;
         }
         prevQuit = quit;
 
+        bool dump = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;   // F9 = raw array dump (diagnostic)
+        if (dump && !prevDump) 
+        {
+            DumpArrayRaw(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+        }
+        prevDump = dump;
+
         auto words = scan();
         std::string now = joined(words);
-        if (now != lastShown) 
-        { 
+        if (now != lastShown)
+        {
             printf("on screen: %s\n", now.empty() ? "(none)" : now.c_str()); 
             lastShown = now; 
         }
