@@ -812,3 +812,15 @@ After the 2nd loop, we just move on after 15 attempts and re read and re type th
 The edge case is that, you might get into permenant stall. If the character genuinely cant land, the bot retries it forever and never moves on. 
 so human intervention is needed then
 
+
+
+19. further future ideas:
+
+allow 2 modes:
+
+    1.  full speed mode (allow mistakes)
+        instead one character at a time, allow bursts of typing, allow desyncs to happen
+
+    2.  full accuracy mode
+        for scenes where it needs full accuracy, type one character at a time
+

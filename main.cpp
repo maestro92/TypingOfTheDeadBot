@@ -968,7 +968,7 @@ int main()
 
         // wait until the game registers the keystroke (progress moves past `typed`) or the
         // word is gone, before reading the next character.
-        for (int attempt = 0; attempt < 15; ++attempt)
+        for (int attempt = 0; attempt < 60; ++attempt)
         {
             std::vector<LiveWord> after = WalkWordArrayFull(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
             const LiveWord* stillLive = nullptr;
@@ -984,7 +984,7 @@ int main()
                 break;                                        // completed and despawned
             if (stillLive->typed > typed)
                 break;                                        // our keystroke registered
-            Sleep(20);
+            Sleep(3);
         }
     }
 
