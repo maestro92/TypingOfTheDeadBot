@@ -247,7 +247,8 @@ void TypeWord(const std::string& word)                 // scan-code version (ACT
             SendInput(1, &s, sizeof(INPUT));
         }
 
-        Sleep(20);                                     // gap between keystrokes
+        if (word.size() > 1)
+            Sleep(10);                                 // gap between keystrokes (multi-char calls only)
     }
 }
 
@@ -951,21 +952,23 @@ int main()
             continue;
         }
 
-        // Type only the REMAINING suffix, so we stay in sync whether the progress came
-        // from us or from the player typing.
-        int start = (target->len > 0 && target->typed > 0) ? target->typed : 0;
-        if (start >= (int)target->text.size())
+        // Type ONE character at a time - always the next un-typed one, re-reading progress
+        // each pass. This never re-sends an already-typed character, and re-syncs if a
+        // keystroke is dropped or the player types part of the word themselves.
+        int typed = (target->len > 0 && target->typed > 0) ? target->typed : 0;
+        if (typed >= (int)target->text.size())
         {
-            Sleep(60);
+            Sleep(30);
             continue;
         }
-        std::string remaining = target->text.substr(start);
+        char nextChar = target->text[typed];
         uint32_t targetStruct = target->structPtr;
-        printf("  bot types \"%s\" (%d/%d done)\n", remaining.c_str(), target->typed, target->len);
-        TypeWord(remaining);
+        printf("  bot types '%c' (%d/%d)\n", nextChar, typed, target->len);
+        TypeWord(std::string(1, nextChar));
 
-        // wait until this word is finished or gone before moving on (avoids re-typing it)
-        for (int attempt = 0; attempt < 20; ++attempt)
+        // wait until the game registers the keystroke (progress moves past `typed`) or the
+        // word is gone, before reading the next character.
+        for (int attempt = 0; attempt < 15; ++attempt)
         {
             std::vector<LiveWord> after = WalkWordArrayFull(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
             const LiveWord* stillLive = nullptr;
@@ -978,10 +981,10 @@ int main()
                 }
             }
             if (!stillLive)
-                break;                                        // despawned = done
-            if (stillLive->len > 0 && stillLive->typed >= stillLive->len)
-                break;                                        // fully typed
-            Sleep(30);
+                break;                                        // completed and despawned
+            if (stillLive->typed > typed)
+                break;                                        // our keystroke registered
+            Sleep(20);
         }
     }
 

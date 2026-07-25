@@ -797,4 +797,18 @@ hence we have:
 
 
 
+18. Also encoutered sync bug, as the bot was typing already typed words.
+The reason is because the bot is doing one single read and then typing the whole the word in burst.
+
+but if the keystroke gets dropped or the read is slightly delayed, you get a desync.
+
+so the solution is to do a read everytime before u type, and only typing 1 character at a time.
+this is needed because Typing a key with SendInput is asynchronous. 
+The keystroke goes into the OS queue, and the game only processes it a frame or two later, then bumps its progress counter at +0x98.
+
+
+After the 2nd loop, we just move on after 15 attempts and re read and re type that character?
+
+The edge case is that, you might get into permenant stall. If the character genuinely cant land, the bot retries it forever and never moves on. 
+so human intervention is needed then
 
