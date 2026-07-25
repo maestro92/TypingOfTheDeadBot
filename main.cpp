@@ -437,25 +437,29 @@ void FindReferrers(HANDLE hProcess, uint32_t lo, uint32_t hi, uint32_t anchor,
 
 // A word struct: vtable at +0, a text pointer at +0x50, and an INLINE copy of the current
 // text at +0x58 (e.g. "MIMOSA", or a single "8"). Constants are image-relative -> add base.
-static const uint32_t WORD_VTABLE_RVA = 0xB2A30;    // 0x004B2A30 - base
-static const uint32_t WORD_PTR_OFF    = 0x50;       // struct -> text pointer (letters/words)
-static const uint32_t WORD_INLINE_OFF = 0x58;       // struct -> inline text (digits & words)
-static const uint32_t WORD_ARRAY_RVA  = 0x4395C4;   // static active-word pointer array
+static const uint32_t WORD_VTABLE_RVA   = 0xB2A30;  // 0x004B2A30 - base
+static const uint32_t WORD_PTR_OFF      = 0x50;     // struct -> text pointer (letters/words)
+static const uint32_t WORD_INLINE_OFF   = 0x58;     // struct -> inline text (digits & words)
+static const uint32_t WORD_PROGRESS_OFF = 0x98;     // packs (charsTyped << 8) | wordLength
+static const uint32_t WORD_ARRAY_RVA    = 0x4395C4; // static active-word pointer array
 
 // Resolve one word-struct pointer -> its dictionary word ("" if not a valid word struct).
 std::string WordFromStruct(HANDLE hProcess, uint32_t structPtr, uint32_t vtable,
                            uintptr_t imgBase, uintptr_t imgEnd)
 {
     if (structPtr < imgEnd) return "";                   // must be a heap object
-    SIZE_T g = 0; uint32_t vt = 0, wp = 0;
-    if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)structPtr, &vt, 4, &g) || g != 4 || vt != vtable)
+    SIZE_T bytesRead = 0;
+    uint32_t vtableValue = 0, wordPtr = 0;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)structPtr, &vtableValue, 4, &bytesRead)
+        || bytesRead != 4 || vtableValue != vtable)
         return "";                                       // wrong/absent vtable -> not a word struct
 
     // Primary: follow the +0x50 pointer into the image (letters, symbols, dictionary words).
-    if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(structPtr + WORD_PTR_OFF), &wp, 4, &g)
-        && g == 4 && wp >= imgBase && wp < imgEnd) {
-        std::string w = ReadWordStrict(hProcess, wp);
-        if (!w.empty()) return w;
+    if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(structPtr + WORD_PTR_OFF), &wordPtr, 4, &bytesRead)
+        && bytesRead == 4 && wordPtr >= imgBase && wordPtr < imgEnd)
+    {
+        std::string word = ReadWordStrict(hProcess, wordPtr);
+        if (!word.empty()) return word;
     }
     // Fallback: number prompts store the digit INLINE at +0x58 (their +0x50 points at
     // non-text data). Reading inline here also works for words stored in place.
@@ -467,14 +471,58 @@ std::vector<std::string> WalkWordArray(HANDLE hProcess, uint32_t arrStart, int s
         uint32_t vtable, uintptr_t imgBase, uintptr_t imgEnd)
 {
     std::vector<std::string> words;
-    for (int i = 0; i < slots; ++i) {
-        uint32_t sp = 0; SIZE_T g = 0;
-        if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(arrStart + i * 4), &sp, 4, &g) || g != 4)
+    for (int slot = 0; slot < slots; ++slot)
+    {
+        uint32_t structPtr = 0;
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(arrStart + slot * 4), &structPtr, 4, &bytesRead) || bytesRead != 4)
             continue;
-        std::string w = WordFromStruct(hProcess, sp, vtable, imgBase, imgEnd);
-        if (!w.empty()) words.push_back(w);
+        std::string word = WordFromStruct(hProcess, structPtr, vtable, imgBase, imgEnd);
+        if (!word.empty()) words.push_back(word);
     }
     return words;
+}
+
+// One live on-screen word: its struct, text, and typing progress read from +0x98.
+struct LiveWord
+{
+    uint32_t structPtr;
+    std::string text;
+    int typed;
+    int len;
+};
+
+// Like WalkWordArray, but also reads each word's progress (+0x98 = (typed<<8)|length)
+// and returns the struct pointer. Deduplicated by struct so a word appears once.
+std::vector<LiveWord> WalkWordArrayFull(HANDLE hProcess, uint32_t arrStart, int slots,
+        uint32_t vtable, uintptr_t imgBase, uintptr_t imgEnd)
+{
+    std::vector<LiveWord> liveWords;
+    for (int slot = 0; slot < slots; ++slot)
+    {
+        uint32_t structPtr = 0;
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(arrStart + slot * 4), &structPtr, 4, &bytesRead) || bytesRead != 4)
+            continue;
+        std::string word = WordFromStruct(hProcess, structPtr, vtable, imgBase, imgEnd);
+        if (word.empty()) continue;
+        bool alreadySeen = false;
+        for (const LiveWord& existing : liveWords)
+        {
+            if (existing.structPtr == structPtr)
+            {
+                alreadySeen = true;
+                break;
+            }
+        }
+        if (alreadySeen) continue;
+        uint32_t progress = 0;
+        ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(structPtr + WORD_PROGRESS_OFF), &progress, 4, &bytesRead);
+        int charsTyped = (int)((progress >> 8) & 0xFF);
+        int wordLength = (int)(progress & 0xFF);
+        liveWords.push_back({ structPtr, word, charsTyped, wordLength });
+    }
+    return liveWords;
 }
 
 // CROSS-CHECK: scan the whole heap for objects carrying the word vtable, read each word.
@@ -524,7 +572,8 @@ void DumpArrayRaw(HANDLE hProcess, uint32_t arrStart, int slots,
                   uint32_t vtable, uintptr_t imgBase, uintptr_t imgEnd)
 {
     printf("---- raw active-word array ----\n");
-    for (int i = 0; i < slots; ++i) {
+    for (int i = 0; i < slots; ++i)
+    {
         uint32_t sp = 0; SIZE_T g = 0;
         if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)(arrStart + i * 4), &sp, 4, &g) || g != 4)
             continue;
@@ -553,6 +602,111 @@ void DumpArrayRaw(HANDLE hProcess, uint32_t arrStart, int slots,
         }
     }
     printf("-------------------------------\n");
+}
+
+// ---- small helpers used by the main loop ----
+void dedup(std::vector<std::string>& words)
+{
+    std::sort(words.begin(), words.end());
+    words.erase(std::unique(words.begin(), words.end()), words.end());
+}
+
+// scan the active-word array and return the deduplicated on-screen words
+std::vector<std::string> scanWords(HANDLE hProcess, uint32_t arrStart, uint32_t vtable,
+                                   uintptr_t base, uintptr_t imgEnd)
+{
+    std::vector<std::string> words = WalkWordArray(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+    dedup(words);
+    return words;
+}
+
+// render a word list as "[a][b][c]" for display / change-detection
+std::string joined(const std::vector<std::string>& words)
+{
+    std::string result;
+    for (const std::string& word : words)
+    {
+        result += '[';
+        result += word;
+        result += ']';
+    }
+    return result;
+}
+
+// address of the first on-screen word struct (heap pointer), 0 if none
+uint32_t firstLiveStruct(HANDLE hProcess, uint32_t arrStart, uint32_t vtable,
+                         uintptr_t base, uintptr_t imgEnd)
+{
+    for (int slot = 0; slot < 64; ++slot)
+    {
+        uint32_t structPtr = 0;
+        SIZE_T bytesRead = 0;
+        if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)((arrStart - 0x20) + slot * 4), &structPtr, 4, &bytesRead)
+            && bytesRead == 4 && !WordFromStruct(hProcess, structPtr, vtable, base, imgEnd).empty())
+            return structPtr;
+    }
+    return 0;
+}
+
+// rising-edge key detector: true only on the frame a key transitions up -> down
+bool KeyEdge(int vk, bool& prev)
+{
+    bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool edge = down && !prev;
+    prev = down;
+    return edge;
+}
+
+// F8: toggle the bot on/off
+void ProcessF8BotToggle(bool& botOn, bool& prevTog)
+{
+    if (KeyEdge(VK_F8, prevTog))
+    {
+        botOn = !botOn;
+        printf("=== bot %s ===\n", botOn ? "ON" : "OFF");
+    }
+}
+
+// F10: returns true on the frame quit is requested
+bool ProcessF10QuitGame(bool& prevQuit)
+{
+    return KeyEdge(VK_F10, prevQuit);
+}
+
+// F9: dump the raw active-word array (diagnostic)
+void ProcessF9RawDump(bool& prevDump, HANDLE hProcess, uint32_t arrStart,
+                      uint32_t vtable, uintptr_t base, uintptr_t imgEnd)
+{
+    if (KeyEdge(VK_F9, prevDump))
+        DumpArrayRaw(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+}
+
+// Print struct fields that changed since the previous poll, skipping animation floats
+// (position/scale). Updates `previous` to the current snapshot. Used by F7 watch mode.
+void ReportWatchChanges(HANDLE hProcess, uint32_t watchPtr, std::vector<uint8_t>& previous,
+                        int watchBytes, uintptr_t base, uintptr_t imgEnd)
+{
+    std::vector<uint8_t> current(watchBytes, 0);
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)watchPtr, current.data(), watchBytes, &bytesRead)
+        || (int)bytesRead < watchBytes)
+        return;
+
+    for (int off = 0; off + 4 <= watchBytes; off += 4)
+    {
+        uint32_t oldValue = 0, newValue = 0;
+        memcpy(&oldValue, &previous[off], 4);
+        memcpy(&newValue, &current[off], 4);
+        if (oldValue == newValue)
+            continue;
+        // keep small ints and image pointers - that's where a counter or text cursor lives.
+        bool interesting = (newValue < 0x10000) || (oldValue < 0x10000)
+                        || (newValue >= base && newValue < imgEnd)
+                        || (oldValue >= base && oldValue < imgEnd);
+        if (interesting)
+            printf("  +0x%02X: %08X -> %08X\n", off, oldValue, newValue);
+    }
+    previous = current;
 }
 
 int main()
@@ -698,55 +852,49 @@ int main()
     const uint32_t vtable   = (uint32_t)base + WORD_VTABLE_RVA;
     const uint32_t arrStart = (uint32_t)base + WORD_ARRAY_RVA;
 
-    auto dedup = [](std::vector<std::string>& v){
-        std::sort(v.begin(), v.end());
-        v.erase(std::unique(v.begin(), v.end()), v.end());
-    };
-    auto scan = [&]{
-        auto v = WalkWordArray(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
-        dedup(v);
-        return v;
-    };
-    auto joined = [](const std::vector<std::string>& v){
-        std::string s; 
-        for (auto& w : v) 
-        { 
-            s += '['; s += w; s += ']'; 
-        } 
-        return s;
-    };
 
-    // F8 = toggle the bot on/off (OFF = hands off, you type yourself);  F10 = quit.
-    // Focus the GAME window: keystrokes go to the foreground app, while F8/F10 are read
+    // F8 = bot on/off;  F7 = watch one struct (finds the progress field);  F9 = raw dump;  F10 = quit.
+    // Focus the GAME window: keystrokes go to the foreground app, while F7-F10 are read
     // globally so they still fire while the game has focus.
-    bool botOn = false, prevTog = false, prevQuit = false, prevDump = false;
+    bool botOn = false, prevTog = false, prevQuit = false, prevDump = false, prevWatch = false;
+    const int WATCH_BYTES = 0xC0;   // watch a wide window - progress fields can sit past +0x60
+    bool watching = false; uint32_t watchPtr = 0; std::vector<uint8_t> watchPrev(WATCH_BYTES, 0);
     std::string lastTyped, lastShown;
-    printf("\nReady - focus the game.   [F8] bot on/off (starts OFF)   [F9] raw dump   [F10] quit\n");
+    printf("\nReady - focus the game.   [F8] bot on/off   [F7] watch struct   [F9] raw dump   [F10] quit\n");
 
-    while (true) {
-        bool tog = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;      // edge-detected toggle
-        if (tog && !prevTog) 
-        { 
-            botOn = !botOn; 
-            printf("=== bot %s ===\n", botOn ? "ON" : "OFF"); 
-        }
-        prevTog = tog;
-
-        bool quit = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (quit && !prevQuit)
-        {
+    while (true)
+    {
+        ProcessF8BotToggle(botOn, prevTog);
+        if (ProcessF10QuitGame(prevQuit))
             break;
-        }
-        prevQuit = quit;
+        ProcessF9RawDump(prevDump, hProcess, arrStart, vtable, base, imgEnd);
 
-        bool dump = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;   // F9 = raw array dump (diagnostic)
-        if (dump && !prevDump) 
+        // F7 = lock onto one word struct and report every field that changes as you type.
+        // The offset(s) that advance while you type correct letters ARE the progress tracker.
+        if (KeyEdge(VK_F7, prevWatch))
         {
-            DumpArrayRaw(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+            watching = !watching;
+            if (watching)
+            {
+                watchPtr = firstLiveStruct(hProcess, arrStart, vtable, base, imgEnd);
+                SIZE_T bytesRead = 0;
+                ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)watchPtr, watchPrev.data(), WATCH_BYTES, &bytesRead);
+                printf("=== WATCH ON  struct=0x%08X - type slowly; changed fields print below ===\n", watchPtr);
+            }
+            else
+            {
+                printf("=== WATCH OFF ===\n");
+            }
         }
-        prevDump = dump;
 
-        auto words = scan();
+        if (watching && watchPtr)
+        {
+            ReportWatchChanges(hProcess, watchPtr, watchPrev, WATCH_BYTES, base, imgEnd);
+            Sleep(80);
+            continue;                 // while watching, don't auto-type - you type manually
+        }
+
+        std::vector<std::string> words = scanWords(hProcess, arrStart, vtable, base, imgEnd);
         std::string now = joined(words);
         if (now != lastShown)
         {
@@ -767,34 +915,73 @@ int main()
             continue; 
         }
 
-        // pick a word we didn't just finish, so we don't spam one mid-despawn
-        std::string target;
-        for (auto& w : words) 
+        // Read the live words WITH progress (+0x98 = (typed<<8)|length).
+        std::vector<LiveWord> live = WalkWordArrayFull(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+        if (live.empty())
         {
-            if (w != lastTyped) 
-            { 
-                target = w; 
-                break; 
-            }
+            Sleep(60);
+            continue;
         }
 
-        if (target.empty()) 
+        // Prefer the word the game is locked onto (started but not finished); otherwise a
+        // fresh word (len unknown for single-char/number prompts -> treat as start-from-0).
+        const LiveWord* target = nullptr;
+        for (const LiveWord& liveWord : live)
         {
-            target = words.front();
-        }
-
-        printf("  bot types \"%s\"\n", target.c_str());
-        TypeWord(target);
-        lastTyped = target;
-
-        // wait briefly for the word to leave the screen, then advance to the next one
-        for (int t = 0; t < 16; ++t) {
-            auto after = scan();
-            if (std::find(after.begin(), after.end(), target) == after.end())
+            if (liveWord.len > 0 && liveWord.typed > 0 && liveWord.typed < liveWord.len)
             {
+                target = &liveWord;
                 break;
             }
-            Sleep(40);
+        }
+        if (!target)
+        {
+            for (const LiveWord& liveWord : live)
+            {
+                if (liveWord.len <= 0 || liveWord.typed < liveWord.len)
+                {
+                    target = &liveWord;
+                    break;
+                }
+            }
+        }
+        if (!target)
+        {
+            Sleep(60);
+            continue;
+        }
+
+        // Type only the REMAINING suffix, so we stay in sync whether the progress came
+        // from us or from the player typing.
+        int start = (target->len > 0 && target->typed > 0) ? target->typed : 0;
+        if (start >= (int)target->text.size())
+        {
+            Sleep(60);
+            continue;
+        }
+        std::string remaining = target->text.substr(start);
+        uint32_t targetStruct = target->structPtr;
+        printf("  bot types \"%s\" (%d/%d done)\n", remaining.c_str(), target->typed, target->len);
+        TypeWord(remaining);
+
+        // wait until this word is finished or gone before moving on (avoids re-typing it)
+        for (int attempt = 0; attempt < 20; ++attempt)
+        {
+            std::vector<LiveWord> after = WalkWordArrayFull(hProcess, arrStart - 0x20, 64, vtable, base, imgEnd);
+            const LiveWord* stillLive = nullptr;
+            for (const LiveWord& liveWord : after)
+            {
+                if (liveWord.structPtr == targetStruct)
+                {
+                    stillLive = &liveWord;
+                    break;
+                }
+            }
+            if (!stillLive)
+                break;                                        // despawned = done
+            if (stillLive->len > 0 && stillLive->typed >= stillLive->len)
+                break;                                        // fully typed
+            Sleep(30);
         }
     }
 

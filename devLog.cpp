@@ -735,3 +735,66 @@ is. Its definitly not ASCII. Low byte is 0x82, not a digit.
                 +88 0x0C76FD18 : 00000035  |5...|  int     
 
 so at +88 (0x58 in hex) offset, we see the actual numbers
+
+
+
+
+17. Tracking down the current progress on the word
+
+So we also want to track down the currently typed word and our progress.
+
+the way we do that is also looking at memory dump
+
+we assume that the progress of the word is tracked on the WordStruct itself
+so we examine bytes on the wordstruct, to see if any bytes have changed
+
+-   start monitoring 
+-   examine memory snapshot 1
+-   type a letter
+-   examine memory snapshot 2
+-   check if theres any difference
+
+
+
+                on screen: [Random]
+                === WATCH ON  struct=0x0A8183B0 - type slowly; changed fields print below ===
+                  +0x4C: 00000000 -> 000000A0
+                  +0x98: 00000006 -> 00000106
+                  +0xA0: 00000000 -> 00000004
+                  +0xA0: 00000004 -> 00000009
+                  +0xA0: 00000009 -> 0000000F
+                  +0x48: 3B8CF400 -> 00000000
+                  ...
+                  ...
+                  +0x98: 00000106 -> 00000206
+                  ...
+                === WATCH OFF ===
+
+
+and you can see that at 
+
+                  +0x98: 00000006 -> 00000106
+                  ...
+                  ...
+                  +0x98: 00000106 -> 00000206
+
+
+06 is the length of the word Random
+
+then 01, 02 is the current progress
+current letters typed
+
+
+essentially you have the mask of 
+
+                chars typed = (value >> 8)
+                word length = (value & 0xFF)
+
+
+hence we have:
+
+                static const uint32_t WORD_PROGRESS_OFF = 0x98;     // packs (charsTyped << 8) | wordLength
+
+
+
+
